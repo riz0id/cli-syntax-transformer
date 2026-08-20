@@ -209,6 +209,7 @@ xform   ::= (define-transformer NAME #:source ID #:target ID
 xset    ::= (define-transformer-set NAME ID ID ...)
 clause  ::= (flag NAME => rhs) | (arg NAME => rhs) | (rest NAME => rhs)
           | (merge (NAME NAME ...) => ref #:by EXPR)
+          | (emit (flag 'NAME) [#:value STRING])
           | (subcommand NAME [=> NAME] clause ...)
           | (subcommand NAME => (drop STRING))
 rhs     ::= ref [#:value EXPR] | keep | (drop STRING)
@@ -280,6 +281,34 @@ different `#:target` specs; the `xform-ok` result carries the chosen one.
 Guards are not checked for disjointness: order is meaningful, first match
 wins.
 
+### 3.8 Target-only emission
+
+The dual of `drop`: the *target* needs a flag the source has no item for.
+The motivating shape is defaults that disagree — `sed -n '/re/p'` prints
+bare matched lines while `rg` prefixes `file:` when given several paths, so
+the faithful rewrite must always say `--no-filename` even though no source
+word selects it. `emit` is a clause with no left-hand side:
+
+```racket
+(emit (flag 'no-filename))            ; a switch, emitted on every rewrite
+(emit (flag 'color) #:value "never")  ; a valued flag with a constant value
+```
+
+An `emit` belongs to a node and fires whenever a rewrite passes through
+that node, after the node's source-driven flags. It claims its target flag
+like any other clause (two clauses mapping the same target item stay an
+error, §4 check 4) and counts toward target totality (§4 check 6) — an
+`emit` can be what produces a required target flag. `#:value` is a string
+literal, parsed under the target flag's declared type at expansion time;
+it is required exactly when the flag takes a value (a bare arity-`'?`
+occurrence may omit it) and forbidden on a switch. Source coverage is
+untouched: `emit` consumes nothing.
+
+Only flags can be emitted. A target-only *positional* constant is
+deliberately absent: positionals carry the invocation's operands, and a
+transformer inventing operand words would no longer be rewriting the
+user's command.
+
 ## 4. Static checking
 
 Expansion performs one simultaneous walk over three trees — the source spec,
@@ -329,9 +358,10 @@ Target side:
 
 6. **Target totality.** For each mapped node pair: required target flags,
    target positionals with minimum arity ≥ 1, and target `one-of` groups
-   must be the image of some clause — otherwise every rewritten invocation
-   would be rejected by the target spec for a missing argument. Likewise, a
-   leaf source node may not map to a target node that demands a subcommand.
+   must be the image of some clause (an `emit`, §3.8, counts) — otherwise
+   every rewritten invocation would be rejected by the target spec for a
+   missing argument. Likewise, a leaf source node may not map to a target
+   node that demands a subcommand.
 
 Guards and sets (§3.6–3.7):
 

@@ -18,6 +18,7 @@
          (struct-out x:drop)
          (struct-out x:absorb)
          (struct-out x:merge)
+         (struct-out x:emit)
          (struct-out x:node)
          (struct-out p:flag)
          (struct-out p:arg)
@@ -48,12 +49,19 @@
 (struct x:absorb () #:transparent)   ; guard-named item with no clause: the
                                      ; guard covers it; consumed silently
 (struct x:merge (members item by blame) #:transparent) ; members: (listof symbol)
+(struct x:emit  (item value blame) #:transparent)
+   ;; a target-only constant (DESIGN.md §3.8): no source item is consumed.
+   ;; item: target flag name before resolution, the target param after;
+   ;; value: the raw #:value literal (or #f) before resolution, the parsed
+   ;; value (shaped for the flag's repeat mode; #t for a switch or a bare
+   ;; arity-'? occurrence) after
 (struct x:node  (rename         ; symbol | #f (same name as the source node)
                  drop           ; string | #f — whole subtree dropped
                  flags          ; ((source-name . action) ...)
                  args           ; ((source-name . action) ...)
                  rst            ; (source-name . action) | #f
                  merges         ; (listof x:merge)
+                 emits          ; (listof x:emit)
                  subs           ; ((source-name . x:node) ...)
                  blame) #:transparent)
 
@@ -426,6 +434,44 @@
       (claim-target-flag! tp (x:merge-blame m))
       (x:merge (x:merge-members m) tp (x:merge-by m) (x:merge-blame m))))
 
+  ;; emits: target-only constants (DESIGN.md §3.8). No source item is
+  ;; consumed, so coverage is untouched — only the target image grows; the
+  ;; #:value literal is parsed under the target flag's declared type here,
+  ;; so a bad literal fails at expansion, not at rewrite
+  (define emits*
+    (for/list ([e (in-list (x:node-emits xn))])
+      (define tp (resolve-target-param (x:emit-item e) (x:emit-blame e)
+                                       "emit"))
+      (claim-target-flag! tp (x:emit-blame e))
+      (define raw (x:emit-value e))
+      (define v
+        (cond
+          [(not (param-type tp))
+           (when raw
+             (fail! (x:emit-blame e)
+                    "emit: target flag ~a is a switch; #:value is not allowed"
+                    (param-name tp)))
+           #t]
+          [(not raw)
+           (unless (eq? (param-arity tp) '?)
+             (fail! (x:emit-blame e)
+                    "emit: target flag ~a takes a value; #:value is required"
+                    (param-name tp)))
+           #t]  ; a bare occurrence of an optional-value flag
+          [else
+           (match (type-parse (param-type tp) raw)
+             [(list 'ok pv) pv]
+             [_ (fail! (x:emit-blame e)
+                       "emit: the value ~s does not parse as target flag ~a's type"
+                       raw (param-name tp))])]))
+      ;; shape the value for the flag's repeat mode, as parse-argv would
+      (define v*
+        (case (param-repeat tp)
+          [(list) (list v)]
+          [(count) 1]
+          [else v]))
+      (x:emit tp v* (x:emit-blame e))))
+
   ;; positionals
   (define args*
     (for/fold ([acc '()] #:result (reverse acc))
@@ -544,4 +590,4 @@
                acc)])))
 
   (x:node (command-name tcmd) #f
-          flags* args* rest* merges* subs* (x:node-blame xn)))
+          flags* args* rest* merges* emits* subs* (x:node-blame xn)))

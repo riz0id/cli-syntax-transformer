@@ -109,6 +109,7 @@
                 args      ; ((name . rhs) ...)
                 rst       ; (name . rhs) | #f
                 merges    ; ((members target-name by-stx blame) ...)
+                emits     ; ((target-name value-or-#f blame) ...)
                 subs      ; ((name . (list 'dropped reason blame)
                           ;        | (list 'node rename nrec blame)) ...)
                 blame))
@@ -149,13 +150,14 @@
     (define args '())
     (define rst #f)
     (define merges '())
+    (define emits '())
     (define subs '())
     (define (dup! what nm c)
       (raise-syntax-error
        'define-transformer (format "duplicate clause for ~a ~a" what nm) c))
     (for ([c (in-list clauses)])
       (syntax-parse c
-        #:datum-literals (flag arg rest merge subcommand => drop)
+        #:datum-literals (flag arg rest merge emit subcommand => drop)
         [(flag n:id => . rhs)
          (define nm (syntax-e #'n))
          (when (assq nm flags) (dup! 'flag nm c))
@@ -173,6 +175,12 @@
                (cons (list (map syntax-e (syntax->list #'(m1 m2 ms ...)))
                            (parse-ref #'ref c 'flag) #'by c)
                      merges))]
+        [(emit ref)
+         (set! emits (cons (list (parse-ref #'ref c 'flag) #f c) emits))]
+        [(emit ref #:value lit:str)
+         (set! emits
+               (cons (list (parse-ref #'ref c 'flag) (syntax-e #'lit) c)
+                     emits))]
         [(subcommand n:id => (drop reason:str))
          (define nm (syntax-e #'n))
          (when (assq nm subs) (dup! 'subcommand nm c))
@@ -199,7 +207,7 @@
         [_ (raise-syntax-error
             'define-transformer "invalid transformer clause" c)]))
     (nrec (reverse flags) (reverse args) rst
-          (reverse merges) (reverse subs) whole))
+          (reverse merges) (reverse emits) (reverse subs) whole))
 
   ;; --- the phase-1 (unresolved) skeleton ------------------------------------
 
@@ -222,10 +230,13 @@
             (for/list ([m (in-list (nrec-merges t))])
               (match-define (list members tname by c) m)
               (x:merge members tname #t c))
+            (for/list ([e (in-list (nrec-emits t))])
+              (match-define (list tname v c) e)
+              (x:emit tname v c))
             (for/list ([e (in-list (nrec-subs t))])
               (match (cdr e)
                 [(list 'dropped reason c)
-                 (cons (car e) (x:node #f reason '() '() #f '() '() c))]
+                 (cons (car e) (x:node #f reason '() '() #f '() '() '() c))]
                 [(list 'node ren sub-t c)
                  (cons (car e) (tree->xnode sub-t ren))]))
             (nrec-blame t)))
@@ -251,11 +262,14 @@
               (list #,@(for/list ([m (in-list (nrec-merges t))])
                          (match-define (list members tname by _) m)
                          #`(x:merge '#,members '#,tname #,by #f)))
+              (list #,@(for/list ([e (in-list (nrec-emits t))])
+                         (match-define (list tname v _) e)
+                         #`(x:emit '#,tname #,v #f)))
               (list #,@(for/list ([e (in-list (nrec-subs t))])
                          (match (cdr e)
                            [(list 'dropped reason _)
                             #`(cons '#,(car e)
-                                    (x:node #f #,reason '() '() #f '() '() #f))]
+                                    (x:node #f #,reason '() '() #f '() '() '() #f))]
                            [(list 'node ren sub-t _)
                             #`(cons '#,(car e) #,(tree->code sub-t ren))])))
               #f)))

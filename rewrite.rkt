@@ -175,7 +175,8 @@
 (define (node-flag-tokens cmd xn vals warn!)
   (define claims (make-claims xn))
   (define emitted (make-hasheq))
-  (apply append
+  (append
+   (apply append
          (for/list ([sp (in-list (command-params cmd))])
            (define act (hash-ref claims (param-name sp) #f))
            (define v (hash-ref vals (param-name sp) absent))
@@ -202,7 +203,12 @@
                   (emit-flag (x:map-item act)
                              (let ([f (x:map-value-fn act)])
                                (if f (f v) v))))]
-             [else '()]))))
+             [else '()])))
+   ;; target-only constants: emitted on every rewrite of this node, after
+   ;; the source-driven flags (resolution already shaped the value)
+   (apply append
+          (for/list ([e (in-list (x:node-emits xn))])
+            (emit-flag (x:emit-item e) (x:emit-value e))))))
 
 ;; positionals are emitted in the *target* node's declared order — the two
 ;; specs may order them differently

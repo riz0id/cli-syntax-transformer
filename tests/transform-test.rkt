@@ -198,6 +198,47 @@
 (check-pred xform-unmatched? (transform-argv git-log-n->jj '("status")))
 
 ;; ---------------------------------------------------------------------------
+;; Target-only emission (DESIGN.md §3.8)
+
+;; a switch emitted on every rewrite, whatever the invocation used
+(define-transformer tiny->t-emit
+  #:source tiny-spec
+  #:target tiny-target
+  (emit (flag 'a))
+  (flag a => (drop "no counterpart"))
+  (flag b => (drop "no counterpart")))
+
+(let ([r (transform-argv tiny->t-emit '())])
+  (check-pred xform-ok? r)
+  (check-equal? (xform-ok-argv r) '("--a"))
+  (check-equal? (xform-ok-warnings r) '()))
+
+;; a valued emit: the literal parses at expansion, renders at rewrite,
+;; and lands after the node's source-driven flags
+(define-transformer tiny->t-emit-val
+  #:source tiny-spec
+  #:target tiny-target
+  (flag a => (flag 'a))
+  (flag b => (drop "gone"))
+  (emit (flag 'b2) #:value "7"))
+
+(let ([r (transform-argv tiny->t-emit-val '("--a"))])
+  (check-pred xform-ok? r)
+  (check-equal? (xform-ok-argv r) '("--a" "--b2" "7")))
+
+;; an emit produces the target's required surface (totality, §4 check 6)
+(define-transformer tiny->req-emit
+  #:source tiny-spec
+  #:target tiny-req-target
+  (flag a => (flag 'a))
+  (flag b => (drop "gone"))
+  (emit (flag 'must) #:value "3"))
+
+(let ([r (transform-argv tiny->req-emit '())])
+  (check-pred xform-ok? r)
+  (check-equal? (xform-ok-argv r) '("--must" "3")))
+
+;; ---------------------------------------------------------------------------
 ;; Static errors (DESIGN.md §4), converted to runtime exns for testing
 
 (check-exn
@@ -294,6 +335,73 @@
         #:target tiny-req-target
         (flag a => (flag 'a))
         (flag b => (drop "gone")))
+      (void)))))
+
+;; --- emits ---
+
+(check-exn
+ #rx"emit: target flag a is a switch; #:value is not allowed"
+ (λ ()
+   (convert-compile-time-error
+    (let ()
+      (define-transformer bad-emit-switch-value
+        #:source tiny-spec
+        #:target tiny-target
+        (flag a => (drop "gone"))
+        (flag b => (drop "gone"))
+        (emit (flag 'a) #:value "1"))
+      (void)))))
+
+(check-exn
+ #rx"emit: target flag b2 takes a value; #:value is required"
+ (λ ()
+   (convert-compile-time-error
+    (let ()
+      (define-transformer bad-emit-missing-value
+        #:source tiny-spec
+        #:target tiny-target
+        (flag a => (drop "gone"))
+        (flag b => (drop "gone"))
+        (emit (flag 'b2)))
+      (void)))))
+
+(check-exn
+ #rx"emit: the value \"zz\" does not parse as target flag b2's type"
+ (λ ()
+   (convert-compile-time-error
+    (let ()
+      (define-transformer bad-emit-literal
+        #:source tiny-spec
+        #:target tiny-target
+        (flag a => (drop "gone"))
+        (flag b => (drop "gone"))
+        (emit (flag 'b2) #:value "zz"))
+      (void)))))
+
+(check-exn
+ #rx"emit: the target has no flag nope here"
+ (λ ()
+   (convert-compile-time-error
+    (let ()
+      (define-transformer bad-emit-unknown
+        #:source tiny-spec
+        #:target tiny-target
+        (flag a => (drop "gone"))
+        (flag b => (drop "gone"))
+        (emit (flag 'nope)))
+      (void)))))
+
+(check-exn
+ #rx"two clauses map to target flag a"
+ (λ ()
+   (convert-compile-time-error
+    (let ()
+      (define-transformer bad-emit-collision
+        #:source tiny-spec
+        #:target tiny-target
+        (flag a => (flag 'a))
+        (flag b => (drop "gone"))
+        (emit (flag 'a)))
       (void)))))
 
 ;; --- guards ---
