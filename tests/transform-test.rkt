@@ -38,6 +38,9 @@
 (check-eq? (transformer-target git->jj) jj-spec)
 (check-equal? (command-name (transformer-target git->jj)) 'jj)
 
+;; an unguarded transformer has no guard
+(check-false (transformer-guard git->jj))
+
 ;; help renders for the target surface
 (check-true (string? (spec->help (transformer-target git->jj) '(jj log))))
 
@@ -48,6 +51,7 @@
            '("--git-dir" "/tmp/r" "log" "-n" "5"
              "--author" "linus" "--oneline"))])
   (check-pred xform-ok? r)
+  (check-eq? (xform-ok-target r) jj-spec)
   (check-equal? (xform-ok-argv r)
                 '("--repository" "/tmp/r" "log" "--limit" "5"
                   "--author" "linus"))
@@ -88,6 +92,110 @@
   (check-equal? (parse-ok-path pr) '(jj log))
   (check-equal? (hash-ref (parse-ok-values pr) 'limit) 5)
   (check-equal? (hash-ref (parse-ok-values pr) 'author) '("linus")))
+
+;; ---------------------------------------------------------------------------
+;; Guards and transformer sets (DESIGN.md §3.6–3.7)
+
+;; presence guard; the guard-named flag needs no clause (absorbed)
+(define-transformer tiny-a->t2
+  #:source tiny-spec
+  #:target tiny-target2
+  #:when (flag a)
+  (flag b => keep))
+
+(define-transformer tiny-any->t
+  #:source tiny-spec
+  #:target tiny-target
+  (flag a => keep)
+  (flag b => (drop "no b")))
+
+(define-transformer-set tiny->either
+  tiny-a->t2
+  tiny-any->t)
+
+(check-true (transformer-set? tiny->either))
+(check-eq? (transformer-set-source tiny->either) tiny-spec)
+(check-equal? (length (transformer-set-members tiny->either)) 2)
+
+;; --a present: the guarded member fires; a is absorbed silently
+(let ([r (transform-argv tiny->either '("--a" "--b"))])
+  (check-pred xform-ok? r)
+  (check-eq? (xform-ok-target r) tiny-target2)
+  (check-equal? (xform-ok-argv r) '("--b"))
+  (check-equal? (xform-ok-warnings r) '()))
+
+;; --a absent: falls through to the unguarded catch-all
+(let ([r (transform-argv tiny->either '("--b"))])
+  (check-pred xform-ok? r)
+  (check-eq? (xform-ok-target r) tiny-target)
+  (check-equal? (xform-ok-argv r) '())
+  (check-equal? (map dropped-name (xform-ok-warnings r)) '(b)))
+
+;; a guarded transformer applied directly reports a non-match
+(check-pred xform-unmatched? (transform-argv tiny-a->t2 '("--b")))
+(check-pred xform-ok? (transform-argv tiny-a->t2 '("--a")))
+
+;; parse errors pass through a set unchanged
+(check-pred parse-error? (transform-argv tiny->either '("--frobnicate")))
+
+;; = value guards parse the literal under the flag's declared type
+(define-transformer tt-x
+  #:source tiny-typed
+  #:target tiny-typed-target
+  #:when (flag mode = "x")
+  (flag k => keep))
+
+(define-transformer tt-else
+  #:source tiny-typed
+  #:target tiny-typed-target
+  (flag mode => keep)
+  (flag k => keep))
+
+(define-transformer-set tt-dispatch
+  tt-x
+  tt-else)
+
+(let ([r (transform-argv tt-dispatch '("--mode" "x" "--k"))])
+  (check-pred xform-ok? r)
+  (check-eq? (xform-ok-target r) tiny-typed-target)
+  (check-equal? (xform-ok-argv r) '("--k")))   ; mode absorbed by the guard
+
+(let ([r (transform-argv tt-dispatch '("--mode" "y" "--k"))])
+  (check-pred xform-ok? r)
+  (check-equal? (xform-ok-argv r) '("--mode" "y" "--k")))
+
+;; subcommand-scoped guards: same mapping as git->jj, but only for
+;; `git log -n …` invocations
+(define-transformer git-log-n->jj
+  #:source git-spec
+  #:target jj-spec
+  #:when (subcommand log (flag n))
+
+  (flag git-dir  => (flag 'repository))
+  (flag paginate => (drop "jj always pages; configure ui.pager instead"))
+
+  (subcommand status => st
+    (merge (short long) => (flag 'format)
+           #:by (λ (s? l?) (cond [s? "short"] [l? "long"] [else #f])))
+    (flag porcelain => (flag 'template)
+          #:value (λ (v) (if (equal? v "v2") "json_status" "text_status")))
+    (arg pathspec => keep))
+
+  (subcommand log
+    (flag n        => (flag 'limit))   ; a clause wins over absorption
+    (flag oneline  => (drop "use -T builtin_log_oneline instead"))
+    (flag author   => keep)
+    (arg  revision => (arg 'revset))
+    (rest paths    => keep))
+
+  (subcommand checkout
+    => (drop "use `jj new`/`jj edit`; no checkout analogue")))
+
+(let ([r (transform-argv git-log-n->jj '("log" "-n" "5"))])
+  (check-pred xform-ok? r)
+  (check-equal? (xform-ok-argv r) '("log" "--limit" "5")))
+(check-pred xform-unmatched? (transform-argv git-log-n->jj '("log")))
+(check-pred xform-unmatched? (transform-argv git-log-n->jj '("status")))
 
 ;; ---------------------------------------------------------------------------
 ;; Static errors (DESIGN.md §4), converted to runtime exns for testing
@@ -186,4 +294,96 @@
         #:target tiny-req-target
         (flag a => (flag 'a))
         (flag b => (drop "gone")))
+      (void)))))
+
+;; --- guards ---
+
+(check-exn
+ #rx"guard: tiny: no flag zz"
+ (λ ()
+   (convert-compile-time-error
+    (let ()
+      (define-transformer bad-guard-name
+        #:source tiny-spec
+        #:target tiny-target
+        #:when (flag zz)
+        (flag a => keep)
+        (flag b => (drop "gone")))
+      (void)))))
+
+(check-exn
+ #rx"flag a is a switch; a = value test needs a valued flag"
+ (λ ()
+   (convert-compile-time-error
+    (let ()
+      (define-transformer bad-guard-switch-test
+        #:source tiny-spec
+        #:target tiny-target
+        #:when (flag a = "1")
+        (flag b => (drop "gone")))
+      (void)))))
+
+(check-exn
+ #rx"does not parse as flag mode's type"
+ (λ ()
+   (convert-compile-time-error
+    (let ()
+      (define-transformer bad-guard-literal
+        #:source tiny-typed
+        #:target tiny-typed-target
+        #:when (flag mode = "z")
+        (flag k => keep))
+      (void)))))
+
+;; the guard only covers the items it names; the rest still need clauses
+(check-exn
+ #rx"does not cover.*tiny → flag b"
+ (λ ()
+   (convert-compile-time-error
+    (let ()
+      (define-transformer bad-guard-coverage
+        #:source tiny-spec
+        #:target tiny-target
+        #:when (flag a))
+      (void)))))
+
+;; --- transformer sets ---
+
+(check-exn
+ #rx"the final member must be unguarded"
+ (λ ()
+   (convert-compile-time-error
+    (let ()
+      (define-transformer-set bad-set-no-catch-all
+        tiny-a->t2)
+      (void)))))
+
+(check-exn
+ #rx"only the final member may be unguarded"
+ (λ ()
+   (convert-compile-time-error
+    (let ()
+      (define-transformer-set bad-set-unreachable
+        tiny-any->t
+        tiny-a->t2)
+      (void)))))
+
+(check-exn
+ #rx"members do not share the same #:source spec"
+ (λ ()
+   (convert-compile-time-error
+    (let ()
+      (define-transformer-set bad-set-sources
+        tt-x
+        tiny-any->t)
+      (void)))))
+
+(check-exn
+ #rx"member is not a transformer defined by define-transformer"
+ (λ ()
+   (convert-compile-time-error
+    (let ()
+      (define-transformer-set bad-set-member
+        tiny-spec
+        tiny-any->t)
       (void)))))

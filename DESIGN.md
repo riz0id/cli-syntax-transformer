@@ -43,9 +43,9 @@ looked at it.
 
 ## 2. What a transformer is
 
-The whole package is **one macro and two operations**. There is no
+The whole package is **two macros and two operations**. There is no
 intermediate representation and no runtime rule engine: all selection and
-checking happens while the macro expands, and what remains at runtime is
+checking happens while the macros expand, and what remains at runtime is
 plain data.
 
 ```racket
@@ -58,7 +58,11 @@ plain data.
 `define-transformer` binds `git->jj` to an opaque `transformer` value
 holding the two specs plus the **resolved mapping**: for each source item,
 its counterpart item in the target spec (the actual struct, resolved during
-expansion) and an optional value-translation procedure.
+expansion) and an optional value-translation procedure. A transformer may
+also carry a **guard** (`#:when`, §3.6) restricting it to a subset of source
+invocations, and guarded transformers combine into a **transformer set**
+(`define-transformer-set`, §3.7) that dispatches an invocation to its first
+matching member — that is the second macro.
 
 The two operations:
 
@@ -70,9 +74,12 @@ The two operations:
 `transform-argv` parses `argv` with the source spec (reusing `parse-argv`;
 no argv lexing is reimplemented), translates the values through the mapping,
 and renders an invocation of the target spec. It returns the rewritten argv
-plus a warning per dropped item the invocation actually used, or the
-underlying `parse-error` unchanged if the source spec rejects the input, or
-an `xform-dropped` when the invocation reaches a dropped subtree.
+plus the target spec it is an invocation of (relevant for sets, where the
+target varies by member) and a warning per dropped item the invocation
+actually used, or the underlying `parse-error` unchanged if the source spec
+rejects the input, or an `xform-dropped` when the invocation reaches a
+dropped subtree, or an `xform-unmatched` when a guarded transformer is
+applied directly to an invocation its guard rejects.
 
 ### 2.1 Why the check can be static
 
@@ -95,7 +102,7 @@ name references — pure syntax, never evaluated — and the `#:value`/`#:by`
 procedures are compiled only into the runtime value.
 
 Specs constructed dynamically at runtime cannot be checked this way by
-definition; supporting them is out of scope (§7.4).
+definition; supporting them is out of scope (§7.5).
 
 ## 3. The mapping language
 
@@ -197,16 +204,81 @@ no rewritten invocation could ever satisfy it.
 ### 3.5 Grammar
 
 ```
-xform   ::= (define-transformer NAME #:source ID #:target ID clause ...)
+xform   ::= (define-transformer NAME #:source ID #:target ID
+              [#:when guard] clause ...)
+xset    ::= (define-transformer-set NAME ID ID ...)
 clause  ::= (flag NAME => rhs) | (arg NAME => rhs) | (rest NAME => rhs)
           | (merge (NAME NAME ...) => ref #:by EXPR)
           | (subcommand NAME [=> NAME] clause ...)
           | (subcommand NAME => (drop STRING))
 rhs     ::= ref [#:value EXPR] | keep | (drop STRING)
 ref     ::= (flag 'NAME) | (arg 'NAME) | (rest 'NAME)
+guard   ::= (flag NAME) | (flag NAME = STRING) | (arg NAME)
+          | (not guard) | (and guard ...) | (or guard ...)
+          | (subcommand NAME guard ...)
 ```
 
 Quoted names in references are canonical; bare names are also accepted.
+
+### 3.6 Guards
+
+A transformer may claim only a *slice* of the source surface. The motivating
+shape is `sed`: `sed -n` invocations rewrite one way (suppressed auto-print
+has a direct analogue in the target), everything else another way, possibly
+to a different target spec entirely. `#:when` attaches that condition:
+
+```racket
+(define-transformer sed-n->awk
+  #:source sed-spec
+  #:target awk-spec
+  #:when (flag n)          ; only invocations that supplied -n
+  clause ...)
+```
+
+A guard is a boolean pattern over the *parsed* invocation, so it shares the
+source spec's vocabulary and none of argv's: `(flag n)` holds when the
+invocation supplied the flag with a non-default value; `(flag NAME = "LIT")`
+additionally requires the parsed value to equal `"LIT"` parsed under the
+flag's declared type (for `#:repeat 'list` flags, membership); `(arg NAME)`
+holds when the positional was supplied (non-empty, if variadic);
+`(subcommand NAME guard ...)` holds when the invocation descends into that
+subcommand and the inner guards (an implicit `and`, possibly empty) hold at
+that node; `not`/`and`/`or` combine as expected.
+
+Guard names resolve against the source spec at expansion time with the same
+diagnostics as clauses (§4); a `=` test on a typeless switch is a syntax
+error, as is a literal its flag's type rejects.
+
+**Absorption.** An item the guard names is covered by the guard: it needs no
+clause, and if it has none it is consumed silently — no tokens emitted, no
+warning. (`sed -n`'s `-n` said everything it had to say by selecting this
+transformer.) A clause on a guard-named item wins over absorption and
+behaves exactly as usual. Items the guard does *not* name keep their full
+coverage obligation: any flag can co-occur with `-n`, so the clause tree
+still mirrors the whole source spec.
+
+`transform-argv` on a guarded transformer applied directly returns
+`(xform-unmatched)` when the guard rejects the parsed invocation.
+
+### 3.7 Transformer sets
+
+Guarded transformers combine into an ordered dispatcher:
+
+```racket
+(define-transformer-set sed->awk
+  sed-n->awk        ; guarded members, tried in order
+  sed-default->awk) ; the final member must be unguarded
+```
+
+`transform-argv` on a set parses argv once with the shared source spec and
+rewrites through the first member whose guard matches. Exhaustiveness is
+syntactic, not semantic: the final member must be unguarded, every earlier
+member must be guarded (an earlier unguarded member would make the rest
+unreachable), and all members must share the same `#:source` spec — each of
+these is an expansion-time error on the offending member. Members may name
+different `#:target` specs; the `xform-ok` result carries the chosen one.
+Guards are not checked for disjointness: order is meaningful, first match
+wins.
 
 ## 4. Static checking
 
@@ -219,7 +291,9 @@ Source side:
 1. **Coverage.** Every flag, positional, and rest clause of every reachable
    source node — *including* `#:hidden` and `#:deprecated` flags, which are
    exactly the ones migration scripts forget — and every subcommand node
-   must have exactly one clause. Missing ones are listed by path:
+   must have exactly one clause. Items the transformer's guard names are
+   the one exception: the guard covers them (§3.6). Missing ones are listed
+   by path:
 
    ```
    git->jj: transformer does not cover its source spec
@@ -259,11 +333,23 @@ Target side:
    would be rejected by the target spec for a missing argument. Likewise, a
    leaf source node may not map to a target node that demands a subcommand.
 
+Guards and sets (§3.6–3.7):
+
+7. **Guard resolution.** Every flag, positional, and subcommand a guard
+   tests must exist at its node of the source spec (with suggestions, as in
+   check 2); a `=` test needs a valued flag, and its literal must parse
+   under that flag's declared type.
+
+8. **Set shape.** Every member of a `define-transformer-set` must be
+   `define-transformer`-bound; all members must share the same `#:source`
+   spec; every member but the last must be guarded; the last must not be.
+
 The net effect is that drift in *either* spec lands somewhere loud: an item
 added to the source fails coverage (1); one removed from the source orphans
 its clause (2); one removed or renamed in the target breaks the reference
 (3); a retype on either side trips the `#:value` requirement (5); a new
-required target field fails totality (6). What cannot be checked statically
+required target field fails totality (6); a removed or retyped item a guard
+tests breaks the guard (7). What cannot be checked statically
 — that value functions behave, and that `#:by` produces a value whenever the
 target requires one — is covered dynamically by the standard property test:
 `gen-invocation` (spec-§4.5) samples valid source argvs and asserts the
@@ -322,7 +408,8 @@ Using it:
 ```racket
 (transform-argv git->jj
   '("--git-dir" "/tmp/r" "log" "-n" "5" "--author" "linus" "--oneline"))
-; ⇒ (xform-ok '("--repository" "/tmp/r" "log" "--limit" "5" "--author" "linus")
+; ⇒ (xform-ok jj-spec   ; the target the rewritten argv is an invocation of
+;             '("--repository" "/tmp/r" "log" "--limit" "5" "--author" "linus")
 ;             (list (dropped 'oneline "use -T builtin_log_oneline instead")))
 
 (spec->help (transformer-target git->jj) '(jj log))
@@ -335,11 +422,13 @@ Collection layout:
 
 ```
 cli-spec-transform/
-  main.rkt       ; public API: define-transformer, for-transform,
-                 ;   transformer-target, transform-argv
+  main.rkt       ; public API: define-transformer, define-transformer-set,
+                 ;   for-transform, transformer-target, transform-argv
   walk.rkt       ; the three-tree walk: coverage, selection, reference
-                 ;   resolution, totality (pure; used at phase 1 and 0)
-  rewrite.rkt    ; transform-argv: parse with source, translate, render
+                 ;   resolution, totality — plus guard resolution and the
+                 ;   set invariants (pure; used at phase 1 and 0)
+  rewrite.rkt    ; transform-argv: parse with source, evaluate guards,
+                 ;   dispatch, translate, render
 ```
 
 Notes:
@@ -352,7 +441,19 @@ Notes:
   module initialization (with the `#:value`/`#:by` procedures compiled in)
   and resolves it again via `make-transformer`. Resolution replaces every
   reference and `keep` with the actual target item struct, so the runtime
-  rewriter never searches the target spec for items.
+  rewriter never searches the target spec for items. Guards follow the same
+  two-phase pattern: a `p:*` skeleton whose `=` literals are raw strings,
+  resolved (names checked, literals parsed, the source param attached) at
+  both phases; guard-named items resolve to an `x:absorb` action when
+  unclaused.
+- **Sets are checked at expansion too.** `define-transformer` binds its name
+  through a compile-time record (a `prop:rename-transformer` struct
+  forwarding expression uses to a hidden runtime definition) carrying the
+  source-spec binding and whether the transformer is guarded;
+  `define-transformer-set` reads members' records via
+  `syntax-local-value/immediate` to enforce the §4 check 8 invariants
+  statically, and the emitted `make-transformer-set` re-checks them at
+  module initialization.
 - **Rendering is the one new runtime piece.** `transform-argv` needs to
   print translated values as an argv of the target spec — a straightforward
   inverse of `parse-argv` for a checked spec. Flags are emitted per node
@@ -375,7 +476,12 @@ Notes:
    "upgrading from 1.x" section needs (renames, drops with reasons, merges
    as prose). A `transformer->doc` renderer is mechanical once the surface
    stabilizes.
-4. **Dynamically built specs.** Programs that construct specs at runtime
+4. **Guard overlap analysis.** Set dispatch is ordered first-match; nothing
+   warns when an earlier guard shadows a later one entirely (`(flag n)`
+   before `(and (flag n) (flag e))`). Deciding subsumption for the current
+   guard language is feasible (it is propositional over a finite vocabulary)
+   but only worth its complexity if shadowing bites in practice.
+5. **Dynamically built specs.** Programs that construct specs at runtime
    would need `resolve-transformer` exposed over a first-class clause
    representation built procedurally. The resolution machinery already
    exists; only a public constructor surface is missing. Left out until

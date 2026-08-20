@@ -5,7 +5,9 @@
 ;; invocation of the target spec. Rendering is the one piece of argv-level
 ;; code this package adds; parsing is cli-spec's parse-argv. This module
 ;; only ever sees resolved skeletons (walk.rkt): actions are x:map (with the
-;; target item struct), x:drop, and x:merge.
+;; target item struct), x:drop, x:absorb, and x:merge. Guarded transformers
+;; and transformer sets dispatch here too: guards are evaluated against the
+;; parsed values, and a set rewrites through its first matching member.
 
 (require racket/match
          racket/string
@@ -17,17 +19,22 @@
 
 (provide (struct-out xform-ok)
          (struct-out xform-dropped)
+         (struct-out xform-unmatched)
          (struct-out dropped)
          xform-result?
          transform-argv)
 
-(struct xform-ok (argv warnings) #:transparent)
+(struct xform-ok (target argv warnings) #:transparent) ; target: the chosen
+                                                       ; target spec
 (struct dropped (name reason) #:transparent)          ; a warning entry
 (struct xform-dropped (path reason) #:transparent)    ; invocation reached a
                                                       ; dropped subtree
+(struct xform-unmatched () #:transparent)             ; a guarded transformer,
+                                                      ; applied directly, whose
+                                                      ; guard does not match
 
 (define (xform-result? v)
-  (or (xform-ok? v) (xform-dropped? v) (parse-error? v)))
+  (or (xform-ok? v) (xform-dropped? v) (xform-unmatched? v) (parse-error? v)))
 
 (define absent (string->uninterned-symbol "absent"))
 
@@ -173,6 +180,7 @@
            (define act (hash-ref claims (param-name sp) #f))
            (define v (hash-ref vals (param-name sp) absent))
            (cond
+             [(x:absorb? act) '()]   ; covered by the guard: consumed silently
              [(x:drop? act)
               (when (flag-used? sp v)
                 (warn! (param-name sp) (x:drop-reason act)))
@@ -203,6 +211,7 @@
   (for ([e (in-list (x:node-args xn))])
     (define act (cdr e))
     (cond
+      [(x:absorb? act) (void)]      ; covered by the guard: consumed silently
       [(x:drop? act)
        (define v (hash-ref vals (car e) absent))
        (when (and (not (eq? v absent)) (not (and (list? v) (null? v))))
@@ -247,14 +256,66 @@
        [else '()])]))
 
 ;; ---------------------------------------------------------------------------
+;; Guard evaluation (DESIGN.md §3.6): guards are resolved (p:flag carries the
+;; source param struct and the parsed = value), so evaluation is a pure walk
+;; over the parsed values and the matched subcommand path
+
+(define (guard-matches? g vals path)
+  (cond
+    [(p:flag? g)
+     (define sp (p:flag-param g))
+     (define v (hash-ref vals (p:flag-name g) absent))
+     (and (flag-used? sp v)
+          (let ([test (p:flag-test g)])
+            (or (not test)
+                (if (eq? (param-repeat sp) 'list)
+                    (and (list? v) (member (car test) v) #t)
+                    (equal? v (car test))))))]
+    [(p:arg? g)
+     (define v (hash-ref vals (p:arg-name g) absent))
+     (and (not (eq? v absent)) (not (and (list? v) (null? v))))]
+    [(p:not? g) (not (guard-matches? (p:not-g g) vals path))]
+    [(p:and? g)
+     (for/and ([x (in-list (p:and-gs g))]) (guard-matches? x vals path))]
+    [(p:or? g)
+     (for/or ([x (in-list (p:or-gs g))]) (guard-matches? x vals path))]
+    [(p:sub? g)
+     (and (pair? path)
+          (eq? (car path) (p:sub-name g))
+          (for/and ([x (in-list (p:sub-gs g))])
+            (guard-matches? x vals (cdr path))))]))
+
+(define (transformer-matches? t pr)
+  (define g (transformer-guard t))
+  (or (not g)
+      (guard-matches? g (parse-ok-values pr) (cdr (parse-ok-path pr)))))
+
+;; ---------------------------------------------------------------------------
 ;; transform-argv
 
 (define (transform-argv t argv)
-  (define src (transformer-source t))
-  (define pr (parse-argv src argv))
   (cond
-    [(parse-error? pr) pr]
+    [(transformer-set? t)
+     (define pr (parse-argv (transformer-set-source t) argv))
+     (cond
+       [(parse-error? pr) pr]
+       [else
+        ;; ordered first-match; the mandatory unguarded tail always matches
+        (define m
+          (for/first ([m (in-list (transformer-set-members t))]
+                      #:when (transformer-matches? m pr))
+            m))
+        (rewrite-parsed m pr)])]
     [else
+     (define pr (parse-argv (transformer-source t) argv))
+     (cond
+       [(parse-error? pr) pr]
+       [(not (transformer-matches? t pr)) (xform-unmatched)]
+       [else (rewrite-parsed t pr)])]))
+
+(define (rewrite-parsed t pr)
+  (define src (transformer-source t))
+  (begin
      (define vals (parse-ok-values pr))
      (define warnings '())
      (define (warn! nm reason)
@@ -298,4 +359,4 @@
                     (cons (symbol->string tname) acc*))]))))
      (if (xform-dropped? result)
          result
-         (xform-ok result (reverse warnings)))]))
+         (xform-ok (transformer-target t) result (reverse warnings)))))

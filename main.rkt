@@ -22,16 +22,29 @@
                      "walk.rkt"))
 
 (provide define-transformer
+         define-transformer-set
          for-transform
          transformer?
          transformer-source
          transformer-target
+         transformer-guard
+         transformer-set?
+         transformer-set-source
+         transformer-set-members
          transform-argv
          (struct-out xform-ok)
          (struct-out xform-dropped)
+         (struct-out xform-unmatched)
          (struct-out dropped)
          xform-result?
-         (all-from-out cli-spec))
+         (all-from-out cli-spec)
+         ;; the compile-time record define-transformer installs; the emitted
+         ;; define-syntax evaluates it in the user's module at phase 1
+         (for-syntax xform-static
+                     xform-static?
+                     xform-static-rt-id
+                     xform-static-src-id
+                     xform-static-guarded?))
 
 ;; ---------------------------------------------------------------------------
 ;; for-transform: require a spec module at phases 0 and 1 (DESIGN.md §2.1)
@@ -45,6 +58,49 @@
 ;; Clause parsing (phase 1)
 
 (begin-for-syntax
+
+  ;; the compile-time record behind every define-transformer binding:
+  ;; prop:rename-transformer forwards expression uses to the hidden runtime
+  ;; definition, and define-transformer-set reads src-id/guarded? for its
+  ;; static checks
+  (struct xform-static (rt-id src-id guarded?)
+    #:property prop:rename-transformer (struct-field-index rt-id))
+
+  ;; --- guards (DESIGN.md §3.6) ----------------------------------------------
+
+  ;; a #:when pattern, parsed into the p:* skeleton; = literals stay raw
+  ;; strings until resolution parses them under the tested flag's type
+  (define (parse-guard g)
+    (syntax-parse g
+      #:datum-literals (flag arg not and or subcommand =)
+      [(flag n:id) (p:flag (syntax-e #'n) #f #f g)]
+      [(flag n:id = lit:str)
+       (p:flag (syntax-e #'n) (list (syntax-e #'lit)) #f g)]
+      [(arg n:id) (p:arg (syntax-e #'n) #f g)]
+      [(not g1) (p:not (parse-guard #'g1))]
+      [(and g1 ...+)
+       (p:and (map parse-guard (syntax->list #'(g1 ...))))]
+      [(or g1 ...+)
+       (p:or (map parse-guard (syntax->list #'(g1 ...))))]
+      [(subcommand n:id g1 ...)
+       (p:sub (syntax-e #'n)
+              (map parse-guard (syntax->list #'(g1 ...)))
+              g)]
+      [_ (raise-syntax-error
+          'define-transformer
+          "expected a guard: (flag name), (flag name = \"value\"), (arg name), (not g), (and g ...), (or g ...), or (subcommand name g ...)"
+          g)]))
+
+  (define (guard->code g)
+    (match g
+      [(p:flag n test _ _)
+       #`(p:flag '#,n #,(if test #`(list #,(car test)) #'#f) #f #f)]
+      [(p:arg n _ _) #`(p:arg '#,n #f #f)]
+      [(p:not g1) #`(p:not #,(guard->code g1))]
+      [(p:and gs) #`(p:and (list #,@(map guard->code gs)))]
+      [(p:or gs)  #`(p:or (list #,@(map guard->code gs)))]
+      [(p:sub n gs _)
+       #`(p:sub '#,n (list #,@(map guard->code gs)) #f)]))
 
   ;; one parsed node of the clause tree; rhs entries are
   ;; (vector kind payload value-stx blame-stx) with kind ∈ 'keep 'drop 'map
@@ -209,7 +265,8 @@
 
 (define-syntax (define-transformer stx)
   (syntax-parse stx
-    [(_ name:id #:source src:id #:target tgt:id clause ...)
+    [(_ name:id #:source src:id #:target tgt:id
+        (~optional (~seq #:when guard-form)) clause ...)
      ;; both specs, at phase 1
      (define (spec-of id-stx what)
        (define v
@@ -230,12 +287,64 @@
        v)
      (define source (spec-of #'src "#:source"))
      (define target (spec-of #'tgt "#:target"))
-     ;; parse and check the mapping
+     ;; parse and check the mapping (and the guard, if any)
+     (define gskel
+       (and (attribute guard-form) (parse-guard #'guard-form)))
      (define tree (parse-node-clauses (syntax->list #'(clause ...)) stx))
      (define (fail blame msg)
        (raise-syntax-error 'define-transformer msg stx
                            (and (syntax? blame) blame)))
-     (resolve-transformer source target (tree->xnode tree #f) fail)
+     (resolve-transformer source target (tree->xnode tree #f) gskel fail)
      ;; emit: rebuild the (checked) transformer at module initialization,
-     ;; with the #:value/#:by procedures compiled in
-     #`(define name (make-transformer src tgt #,(tree->code tree #f)))]))
+     ;; with the #:value/#:by procedures compiled in; name gets the
+     ;; compile-time record so define-transformer-set can check the set
+     ;; statically, and forwards to the runtime binding everywhere else
+     (with-syntax ([rt (generate-temporary #'name)])
+       #`(begin
+           (define rt
+             (make-transformer src tgt #,(tree->code tree #f)
+                               #,(if gskel (guard->code gskel) #'#f)))
+           (define-syntax name
+             (xform-static (quote-syntax rt) (quote-syntax src)
+                           #,(and gskel #t)))))]))
+
+;; ---------------------------------------------------------------------------
+;; define-transformer-set (DESIGN.md §3.7): ordered first-match dispatch over
+;; transformers sharing one source spec. Checked here, at expansion: guarded
+;; members first, exactly one unguarded catch-all last, one source binding.
+
+(define-syntax (define-transformer-set stx)
+  (syntax-parse stx
+    [(_ name:id member:id ...+)
+     (define ms (syntax->list #'(member ...)))
+     (define recs
+       (for/list ([m (in-list ms)])
+         (define-values (v _target)
+           (syntax-local-value/immediate m (λ () (values #f #f))))
+         (unless (xform-static? v)
+           (raise-syntax-error
+            'define-transformer-set
+            "member is not a transformer defined by define-transformer"
+            stx m))
+         v))
+     (define last-i (sub1 (length ms)))
+     (for ([m (in-list ms)] [r (in-list recs)] [i (in-naturals)])
+       (cond
+         [(and (= i last-i) (xform-static-guarded? r))
+          (raise-syntax-error
+           'define-transformer-set
+           "the final member must be unguarded (the set would not be exhaustive)"
+           stx m)]
+         [(and (< i last-i) (not (xform-static-guarded? r)))
+          (raise-syntax-error
+           'define-transformer-set
+           "only the final member may be unguarded (later members would be unreachable)"
+           stx m)]))
+     (define src0 (xform-static-src-id (car recs)))
+     (for ([m (in-list (cdr ms))] [r (in-list (cdr recs))])
+       (unless (free-identifier=? src0 (xform-static-src-id r))
+         (raise-syntax-error
+          'define-transformer-set
+          "members do not share the same #:source spec"
+          stx m)))
+     #'(define name (make-transformer-set (list member ...)))]))

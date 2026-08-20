@@ -1,0 +1,12 @@
+# Racket
+compiled/
+doc/
+*.zo
+*.dep
+
+# direnv
+.direnv/
+
+# Nix
+result
+result-*

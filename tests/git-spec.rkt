@@ -6,7 +6,8 @@
 
 (require cli-spec)
 
-(provide git-spec tiny-spec tiny-target tiny-target2 tiny-req-target)
+(provide git-spec tiny-spec tiny-target tiny-target2 tiny-req-target
+         tiny-typed tiny-typed-target)
 
 (define git-spec
   (cmd 'git
@@ -60,3 +61,14 @@
   (cmd 'R
     (flag 'a)
     (flag 'must 'int #:required? #t)))
+
+;; a typed flag for = guard tests
+(define tiny-typed
+  (cmd 'tt
+    (flag 'mode (enum "x" "y"))
+    (flag 'k)))
+
+(define tiny-typed-target
+  (cmd 'TT
+    (flag 'mode (enum "x" "y"))
+    (flag 'k)))

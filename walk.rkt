@@ -8,17 +8,27 @@
 ;; make-transformer runs the same walk at phase 0, where a failure means the
 ;; phase-1 check was somehow bypassed.
 
-(require racket/string
+(require racket/match
+         racket/string
          cli-spec
          cli-spec/ast)
 
 (provide (struct-out x:map)
          (struct-out x:keep)
          (struct-out x:drop)
+         (struct-out x:absorb)
          (struct-out x:merge)
          (struct-out x:node)
+         (struct-out p:flag)
+         (struct-out p:arg)
+         (struct-out p:not)
+         (struct-out p:and)
+         (struct-out p:or)
+         (struct-out p:sub)
          (struct-out transformer)
+         (struct-out transformer-set)
          make-transformer
+         make-transformer-set
          resolve-transformer)
 
 ;; ---------------------------------------------------------------------------
@@ -35,6 +45,8 @@
 (struct x:map   (item value-fn blame) #:transparent)
 (struct x:keep  (blame) #:transparent)
 (struct x:drop  (reason blame) #:transparent)
+(struct x:absorb () #:transparent)   ; guard-named item with no clause: the
+                                     ; guard covers it; consumed silently
 (struct x:merge (members item by blame) #:transparent) ; members: (listof symbol)
 (struct x:node  (rename         ; symbol | #f (same name as the source node)
                  drop           ; string | #f — whole subtree dropped
@@ -45,10 +57,48 @@
                  subs           ; ((source-name . x:node) ...)
                  blame) #:transparent)
 
-(struct transformer (source target xnode))
+;; Guard skeletons (DESIGN.md §3.6). In p:flag, test is #f (a presence test)
+;; or a one-element list holding the = literal — the raw string before
+;; resolution, the value parsed under the flag's declared type after — and
+;; param is #f before resolution, the source param struct after (evaluation
+;; needs its default and repeat). Likewise p:arg positional.
 
-(define (make-transformer src tgt xn)
-  (transformer src tgt (resolve-transformer src tgt xn)))
+(struct p:flag (name test param blame) #:transparent)
+(struct p:arg  (name positional blame) #:transparent)
+(struct p:not  (g) #:transparent)
+(struct p:and  (gs) #:transparent)
+(struct p:or   (gs) #:transparent)
+(struct p:sub  (name gs blame) #:transparent)
+
+(struct transformer (source target guard xnode))
+
+(define (make-transformer src tgt xn [guard #f])
+  (define-values (guard* xn*) (resolve-transformer src tgt xn guard))
+  (transformer src tgt guard* xn*))
+
+;; ordered first-match dispatch: guarded members first, an unguarded
+;; catch-all last, all over one source spec. define-transformer-set checks
+;; the same invariants at expansion; this is the emitted path's re-check.
+(struct transformer-set (source members))
+
+(define (make-transformer-set members)
+  (unless (and (pair? members) (andmap transformer? members))
+    (raise-argument-error 'make-transformer-set
+                          "a non-empty list of transformers" members))
+  (define src (transformer-source (car members)))
+  (for ([m (in-list (cdr members))])
+    (unless (equal? (transformer-source m) src)
+      (runtime-fail #f "transformer-set members do not share a source spec")))
+  (let loop ([ms members])
+    (cond
+      [(null? (cdr ms))
+       (when (transformer-guard (car ms))
+         (runtime-fail #f "the final transformer-set member must be unguarded"))]
+      [else
+       (unless (transformer-guard (car ms))
+         (runtime-fail #f "only the final transformer-set member may be unguarded"))
+       (loop (cdr ms))]))
+  (transformer-set src members))
 
 ;; ---------------------------------------------------------------------------
 ;; Failure plumbing
@@ -147,17 +197,91 @@
        (type-equal? (positional-type sa) (positional-type ta))))
 
 ;; ---------------------------------------------------------------------------
+;; Guard resolution (DESIGN.md §3.6)
+;;
+;; Validates every name the guard tests against the source spec, parses =
+;; literals under the tested flag's declared type, and records which items
+;; each node's guard mentions — those are exempt from coverage (absorbed).
+
+;; resolve-guard : (or/c #f guard) command fail
+;;              → (values (or/c #f guard) gnames)
+;; gnames : hash of relative path (listof symbol) → (cons flags args), each a
+;; mutable hasheq of name → #t
+(define (resolve-guard g src fail)
+  (define gnames (make-hash))
+  (define (note! rel kind nm)
+    (define cell
+      (hash-ref! gnames rel (λ () (cons (make-hasheq) (make-hasheq)))))
+    (hash-set! (if (eq? kind 'flag) (car cell) (cdr cell)) nm #t))
+  (define (gfail! blame abs fmt . a)
+    (fail blame (format "guard: ~a: ~a"
+                        (spec-path->string abs) (apply format fmt a))))
+  (define (walk g cmd rel abs)
+    (match g
+      [(p:flag nm test _ blame)
+       (define sp
+         (or (for/first ([p (in-list (command-params cmd))]
+                         #:when (eq? (param-name p) nm))
+               p)
+             (gfail! blame abs "no flag ~a here~a"
+                     nm (nearest-note nm (map param-name (command-params cmd))))))
+       (note! rel 'flag nm)
+       (define test*
+         (cond
+           [(not test) #f]
+           [(not (param-type sp))
+            (gfail! blame abs
+                    "flag ~a is a switch; a = value test needs a valued flag"
+                    nm)]
+           [else
+            (match (type-parse (param-type sp) (car test))
+              [(list 'ok v) (list v)]
+              [_ (gfail! blame abs
+                         "the value ~s does not parse as flag ~a's type"
+                         (car test) nm)])]))
+       (p:flag nm test* sp blame)]
+      [(p:arg nm _ blame)
+       (define sa
+         (or (for/first ([a (in-list (command-positionals cmd))]
+                         #:when (eq? (positional-name a) nm))
+               a)
+             (gfail! blame abs "no positional ~a here~a"
+                     nm (nearest-note
+                         nm (map positional-name (command-positionals cmd))))))
+       (note! rel 'arg nm)
+       (p:arg nm sa blame)]
+      [(p:not g1) (p:not (walk g1 cmd rel abs))]
+      [(p:and gs) (p:and (for/list ([x (in-list gs)]) (walk x cmd rel abs)))]
+      [(p:or gs)  (p:or  (for/list ([x (in-list gs)]) (walk x cmd rel abs)))]
+      [(p:sub nm gs blame)
+       (define child
+         (or (for/first ([s (in-list (command-subcommands cmd))]
+                         #:when (eq? (command-name s) nm))
+               s)
+             (gfail! blame abs "no subcommand ~a here~a"
+                     nm (nearest-note
+                         nm (map command-name (command-subcommands cmd))))))
+       (p:sub nm
+              (for/list ([x (in-list gs)])
+                (walk x child
+                      (append rel (list nm)) (append abs (list nm))))
+              blame)]))
+  (values (and g (walk g src '() (list (command-name src)))) gnames))
+
+;; ---------------------------------------------------------------------------
 ;; The walk
 
-;; resolve-transformer : command command x:node [fail] → x:node (resolved)
+;; resolve-transformer : command command x:node [guard] [fail]
+;;                    → (values guard x:node) (both resolved)
 ;; fail : (or/c #f syntax?) string → escapes (raises)
-(define (resolve-transformer src tgt xn [fail runtime-fail])
+(define (resolve-transformer src tgt xn [guard #f] [fail runtime-fail])
   (define uncovered '())      ; (list path class name), reversed
   (define total 0)
   (define (uncover! path class name)
     (set! uncovered (cons (list path class name) uncovered)))
   (define (count!) (set! total (add1 total)))
-  (define result (resolve-node src tgt xn '() uncover! count! fail))
+  (define-values (guard* gnames) (resolve-guard guard src fail))
+  (define result (resolve-node src tgt xn '() gnames uncover! count! fail))
   (when (pair? uncovered)
     (fail #f
           (format
@@ -168,12 +292,17 @@
                       (spec-path->string (car u)) (cadr u) (caddr u)))
             "\n")
            (length uncovered) total)))
-  result)
+  (values guard* result))
 
-(define (resolve-node cmd tcmd xn path uncover! count! fail)
+(define (resolve-node cmd tcmd xn path gnames uncover! count! fail)
   (define here (append path (list (command-name cmd))))
   (define (fail! blame fmt . a)
     (fail blame (format "~a: ~a" (spec-path->string here) (apply format fmt a))))
+
+  ;; items this node's guard tests are covered by the guard (DESIGN.md §3.6)
+  (define gcell (hash-ref gnames (cdr here) #f))
+  (define (guard-covers-flag? nm) (and gcell (hash-ref (car gcell) nm #f)))
+  (define (guard-covers-arg? nm) (and gcell (hash-ref (cdr gcell) nm #f)))
 
   (define params (command-params cmd))
   (define positionals (command-positionals cmd))
@@ -263,7 +392,10 @@
       (define nm (param-name sp))
       (define act (hash-ref claims nm #f))
       (cond
-        [(not act) (uncover! here 'flag nm) acc]
+        [(not act)
+         (cond
+           [(guard-covers-flag? nm) (cons (cons nm (x:absorb)) acc)]
+           [else (uncover! here 'flag nm) acc])]
         [(x:drop? act) (cons (cons nm act) acc)]
         [(x:merge? act) acc]  ; carried in merges*; coverage is satisfied
         [(x:keep? act)
@@ -315,7 +447,10 @@
                  nm))
         (x:map ta vf blame))
       (cond
-        [(not act) (uncover! here 'arg nm) acc]
+        [(not act)
+         (cond
+           [(guard-covers-arg? nm) (cons (cons nm (x:absorb)) acc)]
+           [else (uncover! here 'arg nm) acc])]
         [(x:drop? act) (cons (cons nm act) acc)]
         [(x:keep? act)
          (cons (cons nm (resolve-arg nm (x:keep-blame act)
@@ -404,7 +539,8 @@
                       "the target has no subcommand ~a here~a"
                       tname (nearest-note tname tsnames))))
          (cons (cons (command-name sc)
-                     (resolve-node sc tchild cxn here uncover! count! fail))
+                     (resolve-node sc tchild cxn here gnames
+                                   uncover! count! fail))
                acc)])))
 
   (x:node (command-name tcmd) #f
